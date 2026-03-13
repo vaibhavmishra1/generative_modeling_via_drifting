@@ -1,0 +1,70 @@
+# =========================================================
+# Drifting Model — Pixel Space Configuration
+# DiT-L/2 direct pixel generation (FID 1.61 on ImageNet)
+# =========================================================
+# Reference: "Generative Modeling via Drifting" (Deng et al., 2025)
+# Architecture: ~464M parameters
+# =========================================================
+
+# ── Model ──
+model: "DiT-L/2"
+input_size: 256               # Full image resolution
+in_channels: 3                # RGB pixel space
+num_classes: 1000
+class_dropout_prob: 0.1
+
+# ── Training Mode ──
+latent_space: false
+vae_path: null                # No VAE needed for pixel space
+
+# ── Feature Encoder ──
+feature_encoder: "mae"
+feature_blocks: [7, 15, 23]
+feature_input_size: 256
+
+# ── Drifting Field ──
+drift_temps: [0.05, 0.05, 0.05]
+drift_weights: [1.0, 1.0, 1.0]
+v_norm: true
+
+# ── Sample Queue ──
+per_class_queue_size: 128
+global_queue_size: 1000
+queue_push_size: 64
+
+# ── Optimizer ──
+optimizer: "adamw"
+learning_rate: 1.0e-4
+weight_decay: 0.0
+beta1: 0.9
+beta2: 0.999
+grad_clip: 1.0
+
+# ── Training Schedule ──
+total_steps: 800000
+warmup_steps: 5000
+batch_size: 32
+
+# ── EMA ──
+ema_decay: 0.9999
+
+# ── Mixed Precision ──
+use_amp: true
+amp_dtype: "bf16"
+
+# ── Data ──
+data_path: "/path/to/imagenet"
+image_size: 256
+num_workers: 8
+
+# ── Logging ──
+output_dir: "./outputs"
+experiment_name: "drifting-pixel-dit-l2"
+log_every: 100
+save_every: 10000
+sample_every: 5000
+use_wandb: false
+wandb_project: "drifting-models"
+
+# ── Reproducibility ──
+seed: 42
