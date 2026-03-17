@@ -420,7 +420,7 @@ def run_exp3(save_dir: str, quick: bool = False):
                 fmt="o-", color="steelblue", capsize=4, label="RFF (Gaussian)")
     for y, label, style in [(0.90, "0.90 (pass)", "--"),
                              (0.95, "0.95",        ":"),
-                             (0.99, "0.99",        ".-")]:
+                             (0.99, "0.99",        "-.")]:
         ax.axhline(y=y, color="gray", linestyle=style, alpha=0.7, label=label)
     ax.set_xscale("log")
     ax.set_ylim(0, 1.05)
