@@ -13,12 +13,16 @@ For shift-invariant kernel k(x,y) = φ(x - y), Bochner's theorem gives:
 where Λ is the spectral measure of k and:
   z_w(x) = sqrt(2) * cos(w^T x + b),  b ~ Uniform[0, 2π]
 
-For the Gaussian kernel k_h(x,y) = exp(-||x-y||²/(2h²)):
-  Λ = N(0, h^{-2} I_d)
+Supported kernels:
 
-This module uses the Gaussian kernel (satisfies theoretical conditions K1–K4 from
-Cao et al. 2026) as the RFF target. The existing codebase uses the Laplace kernel;
-this RFF version enables direct comparison.
+  **Laplace** (default — matches the exact drift in drift_field.py):
+    k(x, y) = exp(-||x - y|| / τ)
+    Spectral measure Λ = multivariate Cauchy(0, 1/τ · I_d)
+    Sampling: ω = z / (τ √s),  z ~ N(0, I_d),  s ~ χ²(1)
+
+  **Gaussian** (theoretically preferred, satisfies K1–K4):
+    k(x, y) = exp(-||x - y||² / (2h²))
+    Spectral measure Λ = N(0, h⁻² I_d)
 
 References:
   Rahimi & Recht (2007). Random Features for Large-Scale Kernel Machines. NeurIPS.
@@ -40,30 +44,54 @@ def sample_rff_params(
     D: int,
     bandwidth: float,
     device: torch.device,
+    kernel: str = "laplace",
     seed: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Sample random frequency vectors and phase offsets for RFF.
 
-    For Gaussian kernel k_h(x,y) = exp(-||x-y||²/(2h²)), the spectral
-    distribution is Λ = N(0, h^{-2} I_d), so w ~ N(0, h^{-2} I).
+    The spectral distribution depends on the target kernel:
+
+    **Laplace** k(x,y) = exp(-||x-y||/τ):
+      The d-dimensional Fourier transform of the Laplace kernel is
+        k̂(ω) ∝ 1 / (1 + τ²||ω||²)^{(d+1)/2}
+      which is the density of a d-variate Cauchy(0, 1/τ · I).
+      Sampling: ω = z / (τ √s)  where z ~ N(0, I_d), s ~ χ²(1).
+
+    **Gaussian** k(x,y) = exp(-||x-y||²/(2h²)):
+      Spectral density is N(0, h⁻² I_d).
+      Sampling: ω ~ N(0, h⁻² I_d).
 
     Args:
         d: Input feature dimension
         D: Number of RFF features
-        bandwidth: Kernel bandwidth h (larger h = smoother kernel)
+        bandwidth: Kernel parameter (τ for Laplace, h for Gaussian)
         device: Target device
+        kernel: "laplace" or "gaussian"
         seed: Optional random seed for reproducibility
 
     Returns:
-        W: Frequency matrix [D, d],  w_i ~ N(0, h^{-2} I)
-        b: Phase offsets [D],        b_i ~ Uniform[0, 2π]
+        W: Frequency matrix [D, d]
+        b: Phase offsets [D], b_i ~ Uniform[0, 2π]
     """
     gen = torch.Generator(device=device)
     if seed is not None:
         gen.manual_seed(seed)
 
-    W = torch.randn(D, d, device=device, generator=gen) / bandwidth
+    if kernel == "laplace":
+        # Multivariate Cauchy: ω = z / (τ √s)
+        # where z ~ N(0, I_d) and s ~ χ²(1) = N(0,1)²
+        z = torch.randn(D, d, device=device, generator=gen)
+        # s_i ~ χ²(1) for each frequency vector (scalar per row)
+        s = torch.randn(D, 1, device=device, generator=gen).pow(2)
+        # Clamp to avoid division by zero (limits max frequency)
+        s = s.clamp_min(1e-8)
+        W = z / (bandwidth * s.sqrt())
+    elif kernel == "gaussian":
+        W = torch.randn(D, d, device=device, generator=gen) / bandwidth
+    else:
+        raise ValueError(f"Unknown kernel: {kernel!r}. Use 'laplace' or 'gaussian'.")
+
     b = torch.rand(D, device=device, generator=gen) * (2 * math.pi)
     return W, b
 
@@ -76,8 +104,8 @@ def rff_map(
     """
     Apply the RFF feature map: z(x) = sqrt(2/D) * cos(x W^T + b).
 
-    This gives an unbiased estimator of the Gaussian kernel:
-      E[z(x)^T z(y)] = k_h(x, y)
+    This gives an unbiased estimator of the target kernel:
+      E[z(x)^T z(y)] = k(x, y)
 
     Args:
         x: Input points [N, d]
@@ -102,6 +130,7 @@ def compute_drift_rff(
     bandwidth: float = 0.05,
     v_norm: bool = True,
     neg: Optional[torch.Tensor] = None,
+    kernel: str = "laplace",
     W: Optional[torch.Tensor] = None,
     b: Optional[torch.Tensor] = None,
     seed: Optional[int] = None,
@@ -109,35 +138,35 @@ def compute_drift_rff(
     """
     Compute the RFF-approximated drifting field V^D_{p,q}(x).
 
-    Replaces exact pairwise distance kernel evaluations with RFF inner products:
-      k_D(x, y) = z(x)^T z(y)  ≈  k_h(x, y)  (Gaussian kernel)
+    Replaces exact pairwise-distance kernel evaluations with RFF inner
+    products.  The batch-normalization, V_pos / V_neg split, and
+    v-normalization are identical to the exact version in drift_field.py.
 
-    The batch-normalization structure and V_pos / V_neg computation are identical
-    to the exact version in drifting/drift_field.py. The RFF kernel can produce
-    small negative values for low D, so we clamp before normalization.
+    When ``kernel="laplace"`` (the default), this approximates the *same*
+    Laplace kernel used by ``compute_drift()`` in drift_field.py, giving a
+    true drop-in replacement whose approximation error converges at
+    O(1/√D).
 
     Complexity:
-      Exact:  O(G·(N+P)·d)          — pairwise distances in d-dim
+      Exact:  O(G·(N+P)·d)               — pairwise distances in d-dim
       RFF:    O((G+N+P)·d·D + G·(N+P)·D) — feature mapping + inner products
-
-    For D << d, the RFF formulation is strictly cheaper. The main speedup
-    comes from GPU-friendly matrix multiplications replacing scattered
-    distance computations.
 
     Args:
         gen: Generated samples [G, d] — query points x
         pos: Positive (data) samples [P, d] — y+ from p_data
         D: Number of RFF features (more = more accurate, slower)
-        bandwidth: Gaussian kernel bandwidth h (maps to temperature τ ≈ h²/2)
+        bandwidth: Kernel parameter (τ for Laplace, h for Gaussian)
         v_norm: Normalize V to unit norm per sample
         neg: Optional negative samples [N, d] from queue; defaults to gen
-        W: Pre-sampled frequency matrix [D, d] (reuse across calls for stability)
+        kernel: "laplace" (default, matches exact code) or "gaussian"
+        W: Pre-sampled frequency matrix [D, d] (reuse for stability)
         b: Pre-sampled phase offsets [D]
         seed: Random seed for W, b if not provided
 
     Returns:
         V: RFF-approximated drift vectors [G, d]
     """
+    neg_is_gen = neg is None
     if neg is None:
         neg = gen
 
@@ -147,12 +176,16 @@ def compute_drift_rff(
 
     # Sample RFF params if not provided
     if W is None or b is None:
-        W, b = sample_rff_params(d, D, bandwidth, gen.device, seed)
+        W, b = sample_rff_params(d, D, bandwidth, gen.device,
+                                 kernel=kernel, seed=seed)
 
     # Map all point sets to RFF feature space: z(.) in R^D
     z_gen = rff_map(gen, W, b)   # [G, D]
     z_pos = rff_map(pos, W, b)   # [P, D]
-    z_neg = rff_map(neg, W, b)   # [N, D]  (same as z_gen if neg is gen)
+    if neg_is_gen:
+        z_neg = z_gen
+    else:
+        z_neg = rff_map(neg, W, b)  # [N, D]
 
     # Concatenate targets: [neg; pos] in feature space
     z_targets = torch.cat([z_neg, z_pos], dim=0)   # [N+P, D]
@@ -160,22 +193,28 @@ def compute_drift_rff(
 
     # Approximate kernel matrix via inner products: k_D(x, y) = z(x)^T z(y)
     # Shape: [G, N+P]
-    kernel = z_gen @ z_targets.T
+    kernel_mat = z_gen @ z_targets.T
 
     # Mask self-similarities (same logic as exact version)
-    if neg is gen:
-        kernel[:, :G].fill_diagonal_(0.0)
+    if neg_is_gen:
+        kernel_mat[:, :G].fill_diagonal_(0.0)
 
-    # Clamp to non-negative before batch-normalization.
-    # RFF estimates can be slightly negative for small D; clamping is standard
-    # practice and introduces a negligible bias relative to the O(1/√D) error.
-    kernel = kernel.clamp_min(0.0)
+    # ── Noise-aware thresholding ──
+    # RFF inner products for distant pairs (true kernel ≈ 0) have std ≈ √(2/D).
+    # After naive clamp-to-≥0, this creates a positive noise floor ≈ 0.8·√(2/D)
+    # that corrupts the batch normalization (inflates row_sum / col_sum).
+    #
+    # Fix: subtract a fraction of the noise std before clamping. This removes
+    # the noise floor while preserving signal for pairs with k(x,y) >> noise.
+    # The threshold is conservative (0.5σ) to avoid discarding real signal.
+    noise_std = math.sqrt(2.0 / D)
+    kernel_mat = (kernel_mat - 0.5 * noise_std).clamp_min(0.0)
 
     # Batch-normalized kernel: K_B(x,y) = k_D(x,y) / sqrt(Z_x * Z_y)
-    row_sum = kernel.sum(dim=-1, keepdim=True).clamp_min(1e-12)   # [G, 1]
-    col_sum = kernel.sum(dim=-2, keepdim=True).clamp_min(1e-12)   # [1, N+P]
+    row_sum = kernel_mat.sum(dim=-1, keepdim=True).clamp_min(1e-12)   # [G, 1]
+    col_sum = kernel_mat.sum(dim=-2, keepdim=True).clamp_min(1e-12)   # [1, N+P]
     normalizer = (row_sum * col_sum).sqrt()
-    normalized_kernel = kernel / normalizer
+    normalized_kernel = kernel_mat / normalizer
 
     # Split into negative and positive parts
     neg_kernel = normalized_kernel[:, :N]   # [G, N]
@@ -199,7 +238,7 @@ def compute_drift_rff(
 
 
 # ─────────────────────────────────────────────────────────────
-# Orthogonal RFF variant (lower variance, O(1/D) rate)
+# Orthogonal RFF variant (lower variance, Gaussian kernel only)
 # ─────────────────────────────────────────────────────────────
 
 def sample_orf_params(
@@ -210,14 +249,16 @@ def sample_orf_params(
     seed: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Sample Orthogonal Random Feature (ORF) parameters.
+    Sample Orthogonal Random Feature (ORF) parameters (Gaussian kernel).
 
-    ORF (Yu et al., 2016) replaces i.i.d. frequency vectors with orthogonalized
-    ones. For Gaussian kernel, this reduces the variance from O(1/D) to O(1/D²),
-    giving an effective O(1/D) approximation error (vs O(1/√D) for standard RFF).
+    ORF (Yu et al., 2016) replaces i.i.d. frequency vectors with
+    orthogonalized ones, reducing variance from O(1/D) to O(1/D²)
+    and effective approximation error from O(1/√D) to O(1/D).
 
-    The construction: sample a random orthogonal matrix Q ∈ R^{D×d} and scale
-    each row by a chi-distributed magnitude.
+    Note: ORF is only well-defined for the Gaussian kernel because the
+    orthogonalization relies on rotational invariance of N(0, I).  For the
+    Laplace kernel (Cauchy spectral distribution), standard i.i.d. RFF is
+    used instead.
 
     Args:
         d, D, bandwidth, device, seed: Same as sample_rff_params
@@ -237,9 +278,9 @@ def sample_orf_params(
         block_size = min(remaining, d)
         G_mat = torch.randn(d, d, device=device, generator=gen)
         Q, _ = torch.linalg.qr(G_mat)          # [d, d] orthogonal
-        # Chi-distributed scaling to match spectral norm
-        norms = torch.randn(d, device=device, generator=gen).norm()
-        blocks.append(Q[:block_size] * (norms / math.sqrt(d)))
+        # Chi-distributed row norms to match the Gaussian spectral magnitude
+        norms = torch.randn(d, d, device=device, generator=gen).norm(dim=-1)
+        blocks.append(Q[:block_size] * norms[:block_size].unsqueeze(-1))
         remaining -= block_size
 
     W_orth = torch.cat(blocks, dim=0)[:D]       # [D, d]
@@ -259,15 +300,16 @@ def compute_drift_orf(
     seed: Optional[int] = None,
 ) -> torch.Tensor:
     """
-    RFF drift using Orthogonal Random Features (ORF).
+    RFF drift using Orthogonal Random Features (Gaussian kernel only).
 
     Same interface as compute_drift_rff but uses ORF for better
     approximation quality at the same D.
 
-    Per Yu et al. (2016): ORF achieves O(1/D) error vs O(1/√D) for standard RFF,
-    allowing D=128 ORF to match D=512 standard RFF in approximation quality.
+    Per Yu et al. (2016): ORF achieves O(1/D) error vs O(1/√D) for
+    standard RFF, allowing D=128 ORF to match D=512 standard RFF.
     """
     d = gen.shape[1]
     W, b = sample_orf_params(d, D, bandwidth, gen.device, seed)
     return compute_drift_rff(gen, pos, D=D, bandwidth=bandwidth,
-                             v_norm=v_norm, neg=neg, W=W, b=b)
+                             v_norm=v_norm, neg=neg, kernel="gaussian",
+                             W=W, b=b)
